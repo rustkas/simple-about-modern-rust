@@ -2018,6 +2018,6 @@ Rust продолжает развиваться, поэтому содержа�
 
 ## Автор
 
-**Anatoly Kosorukov**
+**Anatolii Kosorukov**
 
 GitHub: [@rustkas](https://github.com/rustkas)
