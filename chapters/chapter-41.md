@@ -129,6 +129,7 @@ edition = "2024"
 proc-macro = true
 
 [dependencies]
+proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 ```
@@ -276,7 +277,8 @@ pub fn my_trait(input: TokenStream) -> TokenStream {
     // name — идентификатор структуры, например User
     // Далее можно обойти поля, варианты enum и т.д.
 
-    // ...
+    // Здесь мы пока ничего не генерируем.
+    TokenStream::new()
 }
 ```
 
@@ -284,7 +286,6 @@ pub fn my_trait(input: TokenStream) -> TokenStream {
 
 Основные типы `syn`:
 
-```
 | Тип           | Назначение                                            |
 | ------------- | ----------------------------------------------------- |
 | `DeriveInput` | `struct`, `enum` или `union`, переданные derive macro |
@@ -296,7 +297,6 @@ pub fn my_trait(input: TokenStream) -> TokenStream {
 | `Type`        | тип                                                   |
 | `Expr`        | выражение                                             |
 | `Pat`         | pattern                                               |
-```
 
 Пример обхода полей структуры:
 
@@ -448,6 +448,8 @@ fn main() {
 }
 ```
 
+Обратите внимание: `use hello_macro::Hello;` импортирует **derive macro**, а `pub trait Hello` объявляет **трейт** с тем же именем. Конфликта нет: макросы и типы (трейты) живут в разных пространствах имён.
+
 ### `proc-macro` crate
 
 В `hello-macro/src/lib.rs`:
@@ -495,6 +497,8 @@ impl Hello for Person {
 
 Здесь procedural macro не реализует `Hello` во время выполнения программы. Он **генерирует обычный Rust-код**, который затем компилируется как часть программы.
 
+**Важная оговорка.** Сгенерированный код ссылается на трейт просто как `Hello`. Это значит, что макрос **рассчитывает на то, что трейт `Hello` доступен под этим именем в месте вызова**. Если у пользователя нет такого трейта в области видимости, получится ошибка `cannot find trait Hello`. Для настоящих библиотек трейт и макрос обычно выпускают вместе и ссылаются на трейт по абсолютному пути (подробнее об этом — в разделе 41.12).
+
 **Открыть пример в Rust Playground:** для полного примера с собственным derive macro требуется Cargo workspace из двух crates, поэтому его нельзя корректно запустить одной ссылкой Playground. Для проверки используйте структуру проекта из раздела 41.2.
 
 ---
@@ -530,7 +534,48 @@ fn add(a: i32, b: i32) -> i32 {
      item
 ```
 
-### Реализация
+### Наивная реализация и её ошибка
+
+Самый очевидный способ написать «обёртку» вокруг тела функции — вставить исходное тело в `let result = ...;`, а после него напечатать завершающее сообщение:
+
+```rust
+let generated = quote! {
+    #fn_vis #fn_sig {
+        println!("Executing function: {}", stringify!(#fn_name));
+
+        let result = #fn_block;
+
+        println!("Function completed: {}", stringify!(#fn_name));
+
+        result
+    }
+};
+```
+
+Для простой функции `fn add(a, b) { a + b }` это работает. Но попробуйте применить такой макрос к функции с ранним возвратом:
+
+```rust
+#[log_execution]
+fn early(x: i32) -> i32 {
+    if x > 0 {
+        return 1;
+    }
+    0
+}
+```
+
+Вывод будет таким:
+
+```text
+Executing function: early
+early = 1
+```
+
+Строки `Function completed: early` **нет**. Причина: `#fn_block` вставлен как обычный блок внутри новой функции, а `return` внутри блока возвращает управление из **внешней** функции — он пропускает весь код после блока. То же самое произойдёт с оператором `?` и с паникой.
+
+### Правильная реализация: guard с `Drop`
+
+Надёжный способ выполнить код «при любом выходе из функции» — поместить его в `Drop`. Деструктор срабатывает при нормальном завершении, при `return`, при `?` и даже при панике.
 
 `hello-macro/src/lib.rs`:
 
@@ -553,19 +598,18 @@ pub fn log_execution(
 
     let generated = quote! {
         #fn_vis #fn_sig {
-            println!(
-                "Executing function: {}",
-                stringify!(#fn_name)
-            );
+            struct __LogGuard(&'static str);
 
-            let result = #fn_block;
+            impl Drop for __LogGuard {
+                fn drop(&mut self) {
+                    println!("Function completed: {}", self.0);
+                }
+            }
 
-            println!(
-                "Function completed: {}",
-                stringify!(#fn_name)
-            );
+            println!("Executing function: {}", stringify!(#fn_name));
+            let __guard = __LogGuard(stringify!(#fn_name));
 
-            result
+            #fn_block
         }
     };
 
@@ -583,10 +627,19 @@ fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
+#[log_execution]
+fn early(x: i32) -> i32 {
+    if x > 0 {
+        return 1;
+    }
+    0
+}
+
 fn main() {
     let result = add(5, 3);
-
     println!("Result: {result}");
+
+    println!("early = {}", early(5));
 }
 ```
 
@@ -596,7 +649,12 @@ fn main() {
 Executing function: add
 Function completed: add
 Result: 8
+Executing function: early
+Function completed: early
+early = 1
 ```
+
+Теперь завершающее сообщение печатается и при раннем `return`.
 
 Концептуально макрос преобразует:
 
@@ -610,19 +668,26 @@ fn add(a: i32, b: i32) -> i32 {
 
 ```rust
 fn add(a: i32, b: i32) -> i32 {
+    struct __LogGuard(&'static str);
+
+    impl Drop for __LogGuard {
+        fn drop(&mut self) {
+            println!("Function completed: {}", self.0);
+        }
+    }
+
     println!("Executing function: add");
+    let __guard = __LogGuard("add");
 
-    let result = {
+    {
         a + b
-    };
-
-    println!("Function completed: add");
-
-    result
+    }
 }
 ```
 
-**Важно:** этот простой пример специально демонстрирует механизм. В production-макросе нужно отдельно учитывать `async fn`, `unsafe fn`, `extern fn`, generics, `where` clauses, другие атрибуты и особенности возвращаемого значения.
+Обратите внимание на имена `__LogGuard` и `__guard`: они выбраны так, чтобы с большой вероятностью не совпасть с именами из кода пользователя. Почему это важно — в разделе 41.12.
+
+**Важно:** этот пример всё равно демонстрирует механизм, а не является production-макросом. Для `async fn` guard сработает в момент уничтожения future, а не в момент завершения вычисления; `unsafe fn`, `extern fn`, generics, `where`-ограничения и другие атрибуты функции тоже требуют отдельного внимания.
 
 **Открыть пример в Rust Playground:** собственный attribute macro требует отдельного `proc-macro` crate, поэтому полноценный вариант запускается через Cargo workspace, а не через один файл Playground.
 
@@ -755,10 +820,14 @@ enum Color {
 }
 ```
 
-получит диагностическое сообщение:
+получит диагностическое сообщение, указывающее на имя `Color`:
 
 ```text
 error: MyTrait can only be derived for structs
+  --> src/main.rs:3:6
+   |
+ 3 | enum Color {
+   |      ^^^^^
 ```
 
 Это значительно лучше, чем:
@@ -798,31 +867,7 @@ pub fn my_serialize(input: TokenStream) -> TokenStream {
 }
 ```
 
-Теперь procedural macro может анализировать атрибуты полей:
-
-```rust
-use syn::{Data, Fields};
-
-if let Data::Struct(data_struct) = &ast.data {
-    if let Fields::Named(fields) = &data_struct.fields {
-        for field in &fields.named {
-            for attr in &field.attrs {
-                if attr.path().is_ident("my_serialize") {
-                    // Здесь можно разобрать аргументы атрибута
-                }
-            }
-        }
-    }
-}
-```
-
-Для конкретного формата атрибута удобно использовать `syn`. Например, для
-
-```rust
-#[my_serialize(skip)]
-```
-
-можно написать вспомогательную функцию:
+Теперь procedural macro может анализировать атрибуты полей. Для разбора формата `#[my_serialize(skip)]` напишем вспомогательную функцию:
 
 ```rust
 fn is_skip(attr: &syn::Attribute) -> bool {
@@ -830,7 +875,7 @@ fn is_skip(attr: &syn::Attribute) -> bool {
         return false;
     }
 
-    // Простейший вариант: проверяем, что аргумент — идентификатор `skip`
+    // Проверяем, что аргумент — идентификатор `skip`
     matches!(
         attr.parse_args::<syn::Ident>(),
         Ok(ident) if ident == "skip"
@@ -838,7 +883,90 @@ fn is_skip(attr: &syn::Attribute) -> bool {
 }
 ```
 
-На практике лучше сразу собирать структурированную конфигурацию:
+### Полный пример
+
+Соберём всё вместе: derive-макрос `MySerialize` генерирует метод `fields()`, который возвращает имена полей, **кроме** помеченных `#[my_serialize(skip)]`.
+
+`hello-macro/src/lib.rs`:
+
+```rust
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
+
+fn is_skip(attr: &syn::Attribute) -> bool {
+    if !attr.path().is_ident("my_serialize") {
+        return false;
+    }
+
+    matches!(
+        attr.parse_args::<syn::Ident>(),
+        Ok(ident) if ident == "skip"
+    )
+}
+
+#[proc_macro_derive(MySerialize, attributes(my_serialize))]
+pub fn my_serialize(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    let name = &ast.ident;
+
+    let mut field_names = Vec::new();
+
+    if let Data::Struct(data_struct) = &ast.data {
+        if let Fields::Named(fields) = &data_struct.fields {
+            for field in &fields.named {
+                if field.attrs.iter().any(is_skip) {
+                    continue;
+                }
+
+                if let Some(ident) = &field.ident {
+                    field_names.push(ident.to_string());
+                }
+            }
+        }
+    }
+
+    let generated = quote! {
+        impl #name {
+            fn fields() -> &'static [&'static str] {
+                &[#(#field_names),*]
+            }
+        }
+    };
+
+    generated.into()
+}
+```
+
+Конструкция `#(#field_names),*` в `quote!` — это повторение, аналог `$(...),*` из `macro_rules!`: для каждого элемента вектора генерируется один токен, элементы разделяются запятыми.
+
+Использование в `app/src/main.rs`:
+
+```rust
+use hello_macro::MySerialize;
+
+#[derive(MySerialize)]
+struct User {
+    name: String,
+
+    #[my_serialize(skip)]
+    password: String,
+}
+
+fn main() {
+    println!("{:?}", User::fields());
+}
+```
+
+Результат:
+
+```text
+["name"]
+```
+
+Поле `password` не попало в результат, потому что помечено `skip`.
+
+На практике лучше сразу собирать структурированную конфигурацию, а не проверять атрибуты «на месте»:
 
 ```rust
 struct FieldOptions {
@@ -846,15 +974,9 @@ struct FieldOptions {
 }
 
 fn parse_field_options(field: &syn::Field) -> FieldOptions {
-    let mut options = FieldOptions { skip: false };
-
-    for attr in &field.attrs {
-        if is_skip(attr) {
-            options.skip = true;
-        }
+    FieldOptions {
+        skip: field.attrs.iter().any(is_skip),
     }
-
-    options
 }
 ```
 
@@ -979,6 +1101,8 @@ fn __my_macro_helper() {
 }
 ```
 
+Именно так устроен `__LogGuard` из раздела 41.7.
+
 Ещё важнее — абсолютные пути.
 
 Вместо:
@@ -993,7 +1117,7 @@ Option<String>
 ::std::option::Option<String>
 ```
 
-поскольку пользовательский код может иметь собственный `Option` или изменить область видимости.
+поскольку пользовательский код может иметь собственный `Option` или изменить область видимости. По той же причине в разделе 41.6 мы отметили, что `impl Hello for #name` полагается на трейт `Hello` в области видимости пользователя: надёжнее ссылаться на трейт по полному пути.
 
 Поэтому procedural macro должен рассматривать сгенерированный код как обычный код пользователя и тщательно контролировать:
 
@@ -1003,6 +1127,8 @@ Option<String>
 - helper functions;
 - генерируемые типы;
 - возможные конфликты.
+
+**Оговорка про `Span`.** «Unhygienic» — это поведение по умолчанию. Токены, созданные через `quote!`, получают `Span::call_site()`, то есть разрешаются так, будто написаны на месте вызова. Стандартная библиотека `proc_macro` также предоставляет `Span::mixed_site()`: он даёт гигиену, близкую к `macro_rules!` (для локальных переменных имена разрешаются с учётом места определения макроса). Эта возможность полезна, но требует ручного управления `Span` и в обычных макросах встречается реже, чем префиксы вида `__`.
 
 ---
 
@@ -1124,17 +1250,22 @@ fn main() {}
 proc-macro = true
 ```
 
-Компилятор сообщит, что атрибут `#[proc_macro]` можно использовать только в crate типа `proc-macro`.
+Компилятор сообщит о **двух** ошибках:
 
-Это показывает, что procedural macro — специальный тип crate, а не обычная функция с дополнительным атрибутом. ([Rust Documentation][4])
+```text
+error: the `#[proc_macro]` attribute is only usable with crates of the `proc-macro` crate type
+error[E0432]: unresolved import `proc_macro`
+```
+
+Первая ошибка говорит о главном: атрибут `#[proc_macro]` допустим только в crate типа `proc-macro`. Вторая — побочное следствие: crate `proc_macro` автоматически доступен только внутри proc-macro crate, а в обычном crate его пришлось бы подключать вручную строкой `extern crate proc_macro;`.
+
+Если добавить эту строку, останется только первая ошибка. Это показывает, что procedural macro — специальный тип crate, а не обычная функция с дополнительным атрибутом. ([Rust Documentation][4])
 
 ---
 
 ### Эксперимент 2: macro нельзя использовать в том же crate
 
-Создайте `proc-macro` crate и попробуйте вызвать собственный макрос внутри `src/lib.rs`.
-
-Это запрещено:
+Создайте `proc-macro` crate и попробуйте вызвать собственный макрос внутри `src/lib.rs`:
 
 ```rust
 #[proc_macro]
@@ -1143,6 +1274,12 @@ pub fn answer(_input: TokenStream) -> TokenStream {
 }
 
 answer!();
+```
+
+Компилятор ответит:
+
+```text
+error: can't use a procedural macro from the same crate that defines it
 ```
 
 Procedural macro должен быть импортирован и использован из **другого crate**. ([Rust Documentation][1])
@@ -1160,15 +1297,21 @@ pub fn broken(_input: TokenStream) -> TokenStream {
 }
 ```
 
-Затем вызовите:
+Затем вызовите в другом crate:
 
 ```rust
-broken!();
+fn demo() {
+    hello_macro::broken!();
+}
 ```
 
-Procedural macro успешно выполнил свою функцию и вернул токены, но эти токены не являются допустимым Rust-кодом.
+Procedural macro успешно выполнил свою функцию: строка `"this is not valid Rust"` без проблем превратилась в токены (`this`, `is`, `not`, ...), и `parse().unwrap()` не упал. Но эти токены не образуют допустимый Rust-код.
 
-Ошибка возникнет уже на следующем этапе компиляции.
+Ошибка возникнет уже на следующем этапе компиляции и будет указывать на **место вызова макроса**:
+
+```text
+error: expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `is`
+```
 
 Это важная модель:
 
@@ -1225,6 +1368,12 @@ impl Hello for Person {
 
 ---
 
+### Эксперимент 5: ранний `return` ломает наивный `log_execution`
+
+Возьмите наивную версию из раздела 41.7 (с `let result = #fn_block;`) и примените её к функции с `return` внутри `if`. Убедитесь, что завершающее сообщение не печатается. Затем перепишите макрос с `Drop`-guard и сравните вывод.
+
+---
+
 ## Практика
 
 ### Задание 1 — `Describe`
@@ -1253,7 +1402,7 @@ User
   age: u32
 ```
 
-Макрос должен получать имя типа и анализировать поля через `syn`.
+Макрос должен получать имя типа и анализировать поля через `syn`. Чтобы получить текст типа поля, используйте `quote!(#ty).to_string()` — только учтите, что `to_string()` на токенах может вставлять лишние пробелы вокруг знаков препинания (например, `Vec < u8 >`).
 
 ---
 
@@ -1280,7 +1429,7 @@ calculate: 123 µs
 std::time::Instant
 ```
 
-Обратите внимание на сохранение исходной сигнатуры функции.
+Обратите внимание на сохранение исходной сигнатуры функции. Чтобы время печаталось и при раннем `return`, примените тот же приём, что и в `log_execution`: guard с `Drop`, который хранит `Instant` и печатает результат в `drop`.
 
 ---
 
@@ -1310,7 +1459,7 @@ stringify_values!(1 + 2, 10 * 3)
 1 + 2, 10 * 3
 ```
 
-Для этого понадобится работа с `TokenStream`, а не только с вычисленными значениями.
+Подсказка: для этого не нужно ничего вычислять и разбирать. Достаточно вызвать `input.to_string()` у входного `TokenStream` и вернуть строковый литерал через `quote!`. Учтите, что `to_string()` нормализует пробелы, поэтому результат не всегда в точности повторяет форматирование исходника.
 
 ---
 
@@ -1365,7 +1514,7 @@ struct User {
 #[proc_macro_derive(Describe, attributes(describe))]
 ```
 
-и разберите его с помощью `syn`.
+и разберите его с помощью `syn` по образцу `MySerialize` из раздела 41.10.
 
 ---
 
@@ -1386,7 +1535,8 @@ struct User {
 - `proc_macro2` предоставляет удобный `TokenStream` для экосистемы `syn`/`quote`.
 - `syn::Error` позволяет создавать нормальные compile-time diagnostics.
 - Derive macros могут объявлять helper attributes.
-- В отличие от `macro_rules!`, procedural macros **не являются hygienic**.
+- Сгенерированный код должен быть корректен при любых выходах из функции: `return` и `?` внутри вставленного тела пропускают код, написанный после него, поэтому завершающие действия нужно переносить в `Drop`-guard.
+- В отличие от `macro_rules!`, procedural macros **по умолчанию не являются hygienic** (`Span::call_site()`).
 - `cargo expand` позволяет увидеть результат macro expansion.
 - Полноценные procedural macros обычно разрабатываются как Cargo workspace с отдельным crate для макроса и отдельным crate для его использования.
 
@@ -1394,9 +1544,13 @@ struct User {
 
 > `macro_rules!` позволяет сопоставлять синтаксические шаблоны и заменять их другим кодом. Procedural macro идёт дальше: он получает поток токенов, может разобрать его в синтаксическое дерево, выполнить произвольную логику анализа и сгенерировать новый Rust-код.
 >
-> Поэтому procedural macros — это основа многих сложных библиотек Rust: они позволяют превратить описание структуры программы в автоматически сгенерированный, проверяемый компилятором Rust-код.
+> Поэтому procedural macros — это основа многих сложных библиотек Rust: они позволяют превратить описание структуры программы в автоматически сгенерированный, проверяемый компилятором Rust-код. При этом ответственность за корректность сгенерированного кода лежит на авторе макроса: компилятор проверит результат, но не поймёт, что вставленный `return` пропустил ваш «завершающий» код.
 
 [1]: https://doc.rust-lang.org/beta/reference/procedural-macros.html 'Procedural macros - The Rust Reference'
 [2]: https://doc.rust-lang.org/proc_macro/struct.TokenStream.html 'TokenStream in proc_macro - Rust'
 [3]: https://docs.rs/crate/quote/latest/source/README.md 'quote 1.0.47 - Docs.rs'
 [4]: https://doc.rust-lang.org/beta/core/attribute.proc_macro.html 'proc_macro - Rust'
+
+---
+
+Для следующих глав я продолжу сначала запускать код на `rustc`/`cargo` там, где это возможно, а уже потом оценивать текст. Присылайте следующую главу.
